@@ -42,6 +42,7 @@ import dev.aaa1115910.bv.player.AbstractVideoPlayer
 import dev.aaa1115910.bv.player.entity.Audio
 import dev.aaa1115910.bv.player.entity.DanmakuType
 import dev.aaa1115910.bv.player.entity.DefaultSubtitle
+import dev.aaa1115910.bv.player.entity.LiveCodec
 import dev.aaa1115910.bv.player.entity.PlayMode
 import dev.aaa1115910.bv.player.entity.PlayerDefaultStartPosition
 import dev.aaa1115910.bv.player.entity.PortraitVideoFixMode
@@ -83,18 +84,30 @@ class VideoPlayerV3ViewModel(
 ) : ViewModel() {
     private val logger = KotlinLogging.logger { }
 
-    var videoPlayer: AbstractVideoPlayer? by mutableStateOf(null)
+    private var videoPlayerState: AbstractVideoPlayer? by mutableStateOf(null)
+    var videoPlayer: AbstractVideoPlayer?
+        get() = videoPlayerState
+        set(value) {
+            value?.onSeek = ::onVideoSeeked
+            videoPlayerState = value
+        }
     var danmakuPlayer: DanmakuPlayer? by mutableStateOf(null)
     var show by mutableStateOf(false)
     
     override fun onCleared() {
         super.onCleared()
         logger.fInfo { "VideoPlayerV3ViewModel onCleared" }
-        
+
+        stopDanmakuSegmentLoading()
+
         // 清理直播重连任务
         liveRetryJob?.cancel()
         liveRetryJob = null
-        
+
+        // 清理直播URL刷新任务
+        liveUrlRefreshJob?.cancel()
+        liveUrlRefreshJob = null
+
         // 清理直播弹幕资源
         stopLiveDanmaku()
         
@@ -108,7 +121,6 @@ class VideoPlayerV3ViewModel(
         try {
             danmakuPlayer?.release()
             danmakuPlayer = null
-            danmakuData.clear()
             danmakuMasks.clear()
         } catch (e: Exception) {
             logger.fError { "Error releasing danmaku player: ${e.message}" }
@@ -122,7 +134,6 @@ class VideoPlayerV3ViewModel(
     var errorMessage by mutableStateOf("")
 
     private var playData: PlayData? by mutableStateOf(null)
-    val danmakuData: MutableList<DanmakuItemData> = ArrayList()
     val danmakuMasks = mutableStateListOf<DanmakuMaskSegment>()
     var videoShot: VideoShot? by mutableStateOf(null)
     var clipInfoList: List<ClipInfo> by mutableStateOf(emptyList())
@@ -152,6 +163,8 @@ class VideoPlayerV3ViewModel(
     var currentDanmakuArea by mutableFloatStateOf(Prefs.defaultDanmakuArea)
     var currentDanmakuMask by mutableStateOf(Prefs.defaultDanmakuMask)
     var currentDanmakuRollingDurationFactor by mutableFloatStateOf(Prefs.defaultDanmakuRollingDurationFactor)
+    var currentDanmakuFilterLevel by mutableIntStateOf(Prefs.defaultDanmakuFilterLevel)
+    var currentLiveDanmakuFilterLevel by mutableIntStateOf(Prefs.defaultLiveDanmakuFilterLevel)
     var currentSubtitleId by mutableLongStateOf(-1L)
     var currentSubtitleData = mutableStateListOf<SubtitleItem>()
     var currentSubtitleType by mutableStateOf(SubtitleType.CC)
@@ -184,9 +197,33 @@ class VideoPlayerV3ViewModel(
     var currentLiveQn by mutableIntStateOf(0)
     var currentLiveQualityDescription by mutableStateOf("")
     private var liveQnDescMap: Map<Int, String> = emptyMap()
-    
+
+    // 直播编码管理
+    var currentLiveCodec by mutableStateOf(Prefs.defaultLiveCodec)
+
+    // 直播流URL过期时间（毫秒时间戳）
+    var liveStreamExpiresAt by mutableLongStateOf(0L)
+
     // 直播自动重连
     private var liveRetryJob: Job? = null
+
+    // 直播URL主动刷新
+    private var liveUrlRefreshJob: Job? = null
+    private var consecutiveRefreshFailures = 0
+
+    companion object {
+        // 提前刷新的时间（毫秒），默认60秒
+        private const val REFRESH_BEFORE_EXPIRY_MS = 60_000L
+        // 最小刷新间隔（毫秒），防止频繁刷新
+        private const val MIN_REFRESH_INTERVAL_MS = 30_000L
+        // 刷新失败后的重试间隔（毫秒）
+        private const val REFRESH_RETRY_INTERVAL_MS = 10_000L
+        // 最大连续刷新失败次数
+        private const val MAX_REFRESH_FAILURES = 3
+
+        private const val DANMAKU_SEGMENT_DURATION_MS = 6 * 60 * 1000L
+        private const val DANMAKU_SEGMENT_POLL_INTERVAL_MS = 10_000L
+    }
 
     // 直播人气值与高能观众
     var livePopularityText by mutableStateOf("")   // "2.5万人气" (POPULARITY_CHANGE)
@@ -203,6 +240,12 @@ class VideoPlayerV3ViewModel(
     private var liveDanmakuChannel: Channel<DanmakuEvent>? = null
     private val liveDanmakuBuffer = mutableListOf<DanmakuItemData>()
     private var liveDanmakuFlushJob: Job? = null
+
+    // 点播弹幕管理
+    private var danmakuSegmentWatchJob: Job? = null
+    private var currentDanmakuSegmentIndex = -1
+    private val loadedDanmakuSegmentCounts = mutableMapOf<Int, Int>()
+    var currentLoadedDanmakuTotal by mutableIntStateOf(0)
     
     var coin by mutableStateOf(0)
     var favorite by mutableStateOf(0)
@@ -232,6 +275,107 @@ class VideoPlayerV3ViewModel(
         danmakuPlayer?.release()
         danmakuPlayer = DanmakuPlayer(SimpleRenderer())
         logger.fInfo { "(Re)create DanmakuPlayer: $danmakuPlayer" }
+    }
+
+    private fun stopDanmakuSegmentLoading() {
+        danmakuSegmentWatchJob?.cancel()
+        danmakuSegmentWatchJob = null
+        currentDanmakuSegmentIndex = -1
+        loadedDanmakuSegmentCounts.clear()
+        currentLoadedDanmakuTotal = 0
+    }
+
+    private fun getDanmakuSegmentIndex(positionMs: Long): Int {
+        return (positionMs / DANMAKU_SEGMENT_DURATION_MS).toInt() + 1
+    }
+
+    private suspend fun loadDanmakuSegment(cid: Long, positionMs: Long, force: Boolean = false) {
+        val safePosition = positionMs.coerceAtLeast(0L)
+        val segmentIndex = getDanmakuSegmentIndex(safePosition + DANMAKU_SEGMENT_POLL_INTERVAL_MS)
+        if (!force && loadedDanmakuSegmentCounts.containsKey(segmentIndex)) {
+            currentDanmakuSegmentIndex = segmentIndex
+            return
+        }
+
+        var loadedCount = 0
+        runCatching {
+            val segmentData = BiliHttpApi.getDanmakuSeg(
+                cid = cid,
+                avid = currentAid,
+                segmentIndex = segmentIndex,
+                sessData = Prefs.sessData
+            )
+            val filteredDanmaku = segmentData.filter { it.level >= currentDanmakuFilterLevel }
+            val filteredCount = segmentData.size - filteredDanmaku.size
+            if (filteredCount > 0) {
+                addLogs("已取到第 $segmentIndex 包弹幕，过滤了 $filteredCount 条等级 < $currentDanmakuFilterLevel 的弹幕")
+                logger.fInfo { "Filtered $filteredCount danmaku from segment $segmentIndex with level < $currentDanmakuFilterLevel" }
+            }
+
+            val convertedDanmaku = filteredDanmaku.map {
+                DanmakuItemData(
+                    danmakuId = it.dmid,
+                    position = (it.time * 1000).toLong(),
+                    content = it.text,
+                    mode = when (it.type) {
+                        4 -> DanmakuItemData.DANMAKU_MODE_CENTER_TOP
+                        5 -> DanmakuItemData.DANMAKU_MODE_CENTER_BOTTOM
+                        else -> DanmakuItemData.DANMAKU_MODE_ROLLING
+                    },
+                    textSize = it.size,
+                    textColor = Color(it.color).toArgb()
+                )
+            }.sortedBy { it.position }
+            loadedCount = convertedDanmaku.size
+
+            val shouldResume = withContext(Dispatchers.Main) {
+                videoPlayer?.isPlaying == true
+            }
+
+            if (danmakuPlayer == null) {
+                ensureDanmakuPlayer()
+            }
+            withContext(Dispatchers.Main) {
+                danmakuPlayer?.updateData(convertedDanmaku)
+                danmakuPlayer?.seekTo(safePosition)
+                if (shouldResume) {
+                    danmakuPlayer?.start()
+                } else {
+                    danmakuPlayer?.pause()
+                }
+            }
+
+            currentDanmakuSegmentIndex = segmentIndex
+            loadedDanmakuSegmentCounts[segmentIndex] = loadedCount
+            currentLoadedDanmakuTotal = loadedDanmakuSegmentCounts.values.sum()
+        }.onFailure {
+            addLogs("加载第 $segmentIndex 包弹幕失败：${it.localizedMessage}")
+            logger.fWarn { "Load danmaku segment failed: cid=$cid, segment=$segmentIndex, error=${it.stackTraceToString()}" }
+        }.onSuccess {
+            addLogs("已加载第 $segmentIndex 包的 $loadedCount 条弹幕，累计已加载 $currentLoadedDanmakuTotal 条")
+            logger.fInfo { "Load danmaku segment success, cid=$cid, segment=$segmentIndex, size=$loadedCount, total=$currentLoadedDanmakuTotal" }
+        }
+    }
+
+    private fun startDanmakuSegmentWatcher(cid: Long) {
+        danmakuSegmentWatchJob?.cancel()
+        danmakuSegmentWatchJob = viewModelScope.launch(Dispatchers.Default) {
+            while (isActive && currentCid == cid && !isLive) {
+                val position = withContext(Dispatchers.Main) {
+                    videoPlayer?.currentPosition?.coerceAtLeast(0L) ?: 0L
+                }
+                loadDanmakuSegment(cid, position)
+                delay(DANMAKU_SEGMENT_POLL_INTERVAL_MS)
+            }
+        }
+    }
+
+    fun onVideoSeeked(positionMs: Long) {
+        if (isLive || currentCid <= 0L) return
+
+        viewModelScope.launch(Dispatchers.Default) {
+            loadDanmakuSegment(currentCid, positionMs)
+        }
     }
 
     fun loadPlayUrl(
@@ -554,42 +698,21 @@ class VideoPlayerV3ViewModel(
     }
 
     suspend fun loadDanmaku(cid: Long) {
-        runCatching {
-            val danmakuXmlData = BiliHttpApi.getDanmakuXml(cid = cid, sessData = Prefs.sessData)
-            val total = danmakuXmlData.data.size
-            val batchSize = 600 // 分批大小，可根据设备性能调节
+        stopDanmakuSegmentLoading()
+
+        val initialPosition = if (
+            lastPlayed > 0 &&
+            Prefs.playerDefaultStartPosition == PlayerDefaultStartPosition.History
+        ) {
+            lastPlayed.toLong()
+        } else {
             withContext(Dispatchers.Main) {
-                danmakuData.clear()
+                videoPlayer?.currentPosition?.coerceAtLeast(0L) ?: 0L
             }
-            danmakuXmlData.data.asSequence()
-                .chunked(batchSize) // 按批次切分原始数据
-                .forEachIndexed { index, rawBatch ->
-                    val convertedBatch = rawBatch.map {
-                        DanmakuItemData(
-                            danmakuId = it.dmid,
-                            position = (it.time * 1000).toLong(),
-                            content = it.text,
-                            mode = when (it.type) {
-                                4 -> DanmakuItemData.DANMAKU_MODE_CENTER_TOP
-                                5 -> DanmakuItemData.DANMAKU_MODE_CENTER_BOTTOM
-                                else -> DanmakuItemData.DANMAKU_MODE_ROLLING
-                            },
-                            textSize = it.size,
-                            textColor = Color(it.color).toArgb()
-                        )
-                    }
-                    danmakuData.addAll(convertedBatch)
-                    // 让出调度，避免长时间占用 IO/CPU
-                    withContext(Dispatchers.IO) { kotlinx.coroutines.delay(16) }
-                }
-            danmakuPlayer?.updateData(danmakuData.sortedBy { it.position })
-        }.onFailure {
-            addLogs("加载弹幕失败：${it.localizedMessage}")
-            logger.fWarn { "Load danmaku filed: ${it.stackTraceToString()}" }
-        }.onSuccess {
-            addLogs("已加载 ${danmakuData.size} 条弹幕")
-            logger.fInfo { "Load danmaku success, size=${danmakuData.size}" }
         }
+
+        loadDanmakuSegment(cid, initialPosition, force = true)
+        startDanmakuSegmentWatcher(cid)
     }
 
     private suspend fun updateSubtitle() {
@@ -674,6 +797,9 @@ class VideoPlayerV3ViewModel(
     }
 
     suspend fun uploadHistory(time: Int) {
+        if (!Prefs.isLogin) {
+            return@uploadHistory
+        }
         runCatching {
             if (!fromSeason) {
                 logger.info { "Send heartbeat: [avid=$currentAid, cid=$currentCid, time=$time]" }
@@ -902,6 +1028,11 @@ class VideoPlayerV3ViewModel(
         // 取消之前的重连任务
         liveRetryJob?.cancel()
         liveRetryJob = null
+        // 取消之前的URL刷新任务
+        liveUrlRefreshJob?.cancel()
+        liveUrlRefreshJob = null
+        // 重置刷新失败计数
+        consecutiveRefreshFailures = 0
 
         viewModelScope.launch(Dispatchers.IO) {
             logger.fInfo { "Load live stream with quality: roomId=$roomId, qn=$qn" }
@@ -912,7 +1043,7 @@ class VideoPlayerV3ViewModel(
                 ensureDanmakuPlayer()
             }
 
-            val playInfo = LiveStreamUrlFetcher.fetchLiveStreamUrl(roomId, qn)
+            val playInfo = LiveStreamUrlFetcher.fetchLiveStreamUrl(roomId, qn, currentLiveCodec)
             if (playInfo == null) {
                 withContext(Dispatchers.Main) {
                     loadState = RequestState.Failed
@@ -923,6 +1054,7 @@ class VideoPlayerV3ViewModel(
 
             withContext(Dispatchers.Main) {
                 liveStreamUrl = playInfo.streamUrl
+                liveStreamExpiresAt = playInfo.expiresAt
                 currentLiveQn = playInfo.currentQn
                 liveQnDescMap = playInfo.qnDescMap
 
@@ -937,6 +1069,7 @@ class VideoPlayerV3ViewModel(
 
                 currentLiveQualityDescription = playInfo.qnDescMap[playInfo.currentQn] ?: "未知画质"
                 logger.fInfo { "Live quality: current=${playInfo.currentQn} ($currentLiveQualityDescription), available=$qualities" }
+                logger.fDebug { "Live stream URL expires at: ${playInfo.expiresAt}" }
             }
 
             runCatching {
@@ -951,6 +1084,8 @@ class VideoPlayerV3ViewModel(
                 if (liveWebSocket == null) {
                     startLiveDanmaku(roomId)
                 }
+                // 调度URL刷新
+                scheduleLiveUrlRefresh()
             }.onFailure { e ->
                 logger.fError { "Failed to load live stream: ${e.message}" }
                 withContext(Dispatchers.Main) {
@@ -971,6 +1106,17 @@ class VideoPlayerV3ViewModel(
     }
 
     /**
+     * 切换直播编码格式
+     * @param codec 目标编码格式
+     */
+    fun changeLiveCodec(codec: LiveCodec) {
+        logger.fInfo { "Change live codec to: $codec" }
+        currentLiveCodec = codec
+        Prefs.defaultLiveCodec = codec
+        loadLiveStreamWithQuality(liveRoomId, currentLiveQn)
+    }
+
+    /**
      * 直播流错误时自动重连
      * 延迟 2 秒后重新获取直播流 URL 并播放。
      * 使用 liveRetryJob 做防抖：新的重连请求会取消上一次未执行的延迟重试。
@@ -982,6 +1128,10 @@ class VideoPlayerV3ViewModel(
 
         // 防抖：取消上一次待执行的重试
         liveRetryJob?.cancel()
+        // 取消URL刷新任务
+        liveUrlRefreshJob?.cancel()
+        liveUrlRefreshJob = null
+
         liveRetryJob = viewModelScope.launch(Dispatchers.IO) {
             delay(2000)
             // 仅在播放器未在播放时重试
@@ -996,7 +1146,7 @@ class VideoPlayerV3ViewModel(
                 // 重连时先清除错误状态，让 UI 不再显示错误
                 errorMessage = ""
             }
-            val playInfo = LiveStreamUrlFetcher.fetchLiveStreamUrl(liveRoomId, currentLiveQn)
+            val playInfo = LiveStreamUrlFetcher.fetchLiveStreamUrl(liveRoomId, currentLiveQn, currentLiveCodec)
             if (playInfo == null) {
                 // fetchLiveStreamUrl 内部已判断 liveStatus != 1 并 Toast "主播未开播"
                 // 此时不再继续重试
@@ -1010,6 +1160,7 @@ class VideoPlayerV3ViewModel(
             // 成功获取新 URL，重新播放
             withContext(Dispatchers.Main) {
                 liveStreamUrl = playInfo.streamUrl
+                liveStreamExpiresAt = playInfo.expiresAt
                 currentLiveQn = playInfo.currentQn
                 videoPlayer?.playUrl(videoUrl = playInfo.streamUrl)
                 videoPlayer?.prepare()
@@ -1017,6 +1168,100 @@ class VideoPlayerV3ViewModel(
                 loadState = RequestState.Success
             }
             logger.fInfo { "Live stream retry successful, new URL loaded" }
+            // 重置刷新失败计数并重新调度刷新
+            consecutiveRefreshFailures = 0
+            scheduleLiveUrlRefresh()
+        }
+    }
+
+    /**
+     * 调度直播流URL的主动刷新
+     * 在URL过期前REFRESH_BEFORE_EXPIRY_MS毫秒自动刷新
+     */
+    private fun scheduleLiveUrlRefresh() {
+        // 取消之前的刷新任务
+        liveUrlRefreshJob?.cancel()
+
+        if (!isLive || liveStreamExpiresAt <= 0) {
+            logger.fDebug { "No need to schedule refresh: isLive=$isLive, expiresAt=$liveStreamExpiresAt" }
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        val timeUntilExpiry = liveStreamExpiresAt - now
+        val refreshDelay = (timeUntilExpiry - REFRESH_BEFORE_EXPIRY_MS)
+            .coerceAtLeast(MIN_REFRESH_INTERVAL_MS)
+
+        logger.fInfo { "Scheduling live URL refresh in ${refreshDelay}ms (expires at $liveStreamExpiresAt)" }
+
+        liveUrlRefreshJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(refreshDelay)
+            refreshLiveStreamUrl()
+        }
+    }
+
+    /**
+     * 刷新直播流URL（无缝切换）
+     */
+    private suspend fun refreshLiveStreamUrl() {
+        if (!isLive) return
+
+        logger.fInfo { "Refreshing live stream URL for room $liveRoomId" }
+
+        try {
+            val playInfo = LiveStreamUrlFetcher.fetchLiveStreamUrl(
+                liveRoomId,
+                currentLiveQn,
+                currentLiveCodec
+            )
+
+            if (playInfo == null) {
+                // 刷新失败，可能是直播已结束
+                consecutiveRefreshFailures++
+                logger.fWarn { "Failed to refresh live URL (attempt $consecutiveRefreshFailures), live may have ended" }
+
+                if (consecutiveRefreshFailures >= MAX_REFRESH_FAILURES) {
+                    // 多次失败，可能直播已结束，停止刷新
+                    logger.fWarn { "Max refresh failures reached, stopping refresh" }
+                    withContext(Dispatchers.Main) {
+                        loadState = RequestState.Failed
+                        errorMessage = "直播可能已结束"
+                    }
+                    return
+                }
+
+                // 如果直播未结束但刷新失败，稍后重试
+                delay(REFRESH_RETRY_INTERVAL_MS)
+                scheduleLiveUrlRefresh()
+                return
+            }
+
+            // 重置失败计数
+            consecutiveRefreshFailures = 0
+
+            // 更新URL和过期时间
+            withContext(Dispatchers.Main) {
+                liveStreamUrl = playInfo.streamUrl
+                liveStreamExpiresAt = playInfo.expiresAt
+                currentLiveQn = playInfo.currentQn
+            }
+
+            // 无缝切换：更新播放器URL
+            withContext(Dispatchers.Main) {
+                videoPlayer?.playUrl(videoUrl = playInfo.streamUrl)
+            }
+
+            logger.fInfo { "Live URL refreshed successfully, new expiresAt=$liveStreamExpiresAt" }
+
+            // 调度下一次刷新
+            scheduleLiveUrlRefresh()
+        } catch (e: Exception) {
+            logger.fError { "Error refreshing live URL: ${e.message}" }
+            consecutiveRefreshFailures++
+            if (consecutiveRefreshFailures < MAX_REFRESH_FAILURES) {
+                delay(REFRESH_RETRY_INTERVAL_MS)
+                scheduleLiveUrlRefresh()
+            }
         }
     }
 
@@ -1162,6 +1407,12 @@ class VideoPlayerV3ViewModel(
      * 添加直播弹幕到缓冲区
      */
     private fun addLiveDanmaku(event: DanmakuEvent) {
+        // 添加用户等级过滤逻辑
+        if (event.userLevel < currentLiveDanmakuFilterLevel) {
+            logger.fInfo { "Filtered live danmaku: userLevel=${event.userLevel} < $currentLiveDanmakuFilterLevel" }
+            return
+        }
+
         val danmakuItem = DanmakuItemData(
             danmakuId = System.currentTimeMillis(),
             position = 0L, 

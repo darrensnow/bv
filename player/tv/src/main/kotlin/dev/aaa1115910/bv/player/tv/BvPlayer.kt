@@ -43,6 +43,7 @@ import dev.aaa1115910.bv.player.BvVideoPlayer
 import dev.aaa1115910.bv.player.VideoPlayerListener
 import dev.aaa1115910.bv.player.entity.Audio
 import dev.aaa1115910.bv.player.entity.DanmakuType
+import dev.aaa1115910.bv.player.entity.LiveCodec
 import dev.aaa1115910.bv.player.entity.LocalVideoPlayerClockState
 import dev.aaa1115910.bv.player.entity.LocalVideoPlayerConfigData
 import dev.aaa1115910.bv.player.entity.LocalVideoPlayerDanmakuMasksData
@@ -107,12 +108,14 @@ fun BvPlayer(
     onPlaySpeedChange: (Float) -> Unit,
     onAudioChange: (Audio, afterChange: suspend () -> Unit) -> Unit,
     onLiveQualityChange: (Int) -> Unit = {},
+    onLiveCodecChange: (LiveCodec) -> Unit = {},
     onDanmakuSwitchChange: (List<DanmakuType>) -> Unit,
     onDanmakuSizeChange: (Float) -> Unit,
     onDanmakuOpacityChange: (Float) -> Unit,
     onDanmakuAreaChange: (Float) -> Unit,
     onDanmakuMaskChange: (Boolean) -> Unit,
     onDanmakuRollingDurationFactorChange: (Float) -> Unit,
+    onDanmakuFilterLevelChange: (Int) -> Unit = {},
     onSubtitleChange: (Subtitle) -> Unit,
     onSubtitleSizeChange: (TextUnit) -> Unit,
     onSubtitleBackgroundOpacityChange: (Float) -> Unit,
@@ -543,10 +546,6 @@ fun BvPlayer(
         focusRequester.requestFocus(scope)
     }
 
-    LaunchedEffect(videoPlayerConfigData.isLoop, videoPlayerConfigData.showDanmaku) {
-        videoPlayer.setPlayerEventListener(videoPlayerListener)
-    }
-
     LaunchedEffect(danmakuPlayer) {
         logger.debug { "update mDanmakuPlayer" }
         mDanmakuPlayer = danmakuPlayer
@@ -783,6 +782,7 @@ fun BvPlayer(
                 }
             },
             onLiveQualityChange = onLiveQualityChange,
+            onLiveCodecChange = onLiveCodecChange,
             onDanmakuSwitchChange = { enabledDanmakuTypes ->
                 logger.info { "On enabled danmaku type change: $enabledDanmakuTypes" }
                 onDanmakuSwitchChange(enabledDanmakuTypes)
@@ -806,6 +806,10 @@ fun BvPlayer(
             onDanmakuMaskChange = { mask ->
                 logger.info { "On danmaku mask change: $mask" }
                 onDanmakuMaskChange(mask)
+            },
+            onDanmakuFilterLevelChange = { filterLevel ->
+                logger.info { "On danmaku filter level change: $filterLevel" }
+                onDanmakuFilterLevelChange(filterLevel)
             },
             onDanmakuRollingDurationFactorChange = { factor ->
                 logger.info { "On danmaku rolling duration factor change: $factor" }

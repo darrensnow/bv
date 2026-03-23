@@ -92,6 +92,9 @@ fun PlayerSetting(
     var skipPgcIntroOutro by remember { mutableStateOf(Prefs.skipPgcIntroOutro) }
     var showControllerButtonDialog by remember { mutableStateOf(false) }
     var defaultSubtitle by remember { mutableStateOf(Prefs.defaultSubtitle) }
+    var defaultDanmakuFilterLevel by remember { mutableStateOf(Prefs.defaultDanmakuFilterLevel) }
+    var defaultLiveDanmakuFilterLevel by remember { mutableStateOf(Prefs.defaultLiveDanmakuFilterLevel) }
+
 
     Column(
         modifier = modifier.fillMaxSize(),
@@ -354,6 +357,36 @@ fun PlayerSetting(
                     title = "控制栏按钮",
                     supportText = "自定义控制栏按钮的显示、排序和默认焦点",
                     onClick = { showControllerButtonDialog = true }
+                )
+            }
+            item {
+                SettingNumberListItem(
+                    title = stringResource(R.string.settings_player_danmaku_filter_level_title),
+                    supportText = stringResource(R.string.settings_player_danmaku_filter_level_text),
+                    value = defaultDanmakuFilterLevel.toDouble(),
+                    minValue = 0.0,
+                    maxValue = 10.0,
+                    isInteger = true,
+                    step = 1.0,
+                    onValueChange = {
+                        defaultDanmakuFilterLevel = it.toInt()
+                        Prefs.defaultDanmakuFilterLevel = it.toInt()
+                    }
+                )
+            }
+            item {
+                SettingNumberListItem(
+                    title = stringResource(R.string.settings_live_danmaku_filter_level_title),
+                    supportText = stringResource(R.string.settings_live_danmaku_filter_level_text),
+                    value = defaultLiveDanmakuFilterLevel.toDouble(),
+                    minValue = 0.0,
+                    maxValue = 60.0,
+                    isInteger = true,
+                    step = 1.0,
+                    onValueChange = {
+                        defaultLiveDanmakuFilterLevel = it.toInt()
+                        Prefs.defaultLiveDanmakuFilterLevel = it.toInt()
+                    }
                 )
             }
         }

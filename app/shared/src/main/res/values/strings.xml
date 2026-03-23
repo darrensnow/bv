@@ -215,6 +215,11 @@
     <string name="settings_item_storage">存储管理</string>
     <string name="settings_item_ui">界面设置</string>
     <string name="settings_item_player">播放设置</string>
+    <string name="settings_item_danmaku_filter">弹幕过滤</string>
+    <string name="settings_player_danmaku_filter_level_title">视频弹幕过滤等级</string>
+    <string name="settings_player_danmaku_filter_level_text">过滤等级低于设定值的弹幕（0-10，0为显示全部）</string>
+    <string name="settings_live_danmaku_filter_level_title">直播弹幕过滤等级</string>
+    <string name="settings_live_danmaku_filter_level_text">过滤用户等级低于设定值的弹幕（0-60，0为显示全部）</string>
     <string name="settings_network_enable_proxy_text">使用自定义代理服务器获取部分视频播放地址</string>
     <string name="settings_network_enable_proxy_title">启用代理</string>
     <string name="settings_network_prefer_official_cdn_text">优先使用获取到的官方 CDN</string>
