@@ -32,6 +32,10 @@ object NetworkUtil {
     }
 
     suspend fun isMainlandChina() = withContext(Dispatchers.IO) {
+        // 已禁用大陆地区IP限制检查，始终返回 false
+        false
+        
+        /* 原始检查逻辑已注释
         val deferreds = locCheckUrls.map { locCheckUrl ->
             async {
                 runCatching {
@@ -56,5 +60,6 @@ object NetworkUtil {
         }.also {
             deferreds.forEach { it.cancel() }
         }
+        */
     }
 }
